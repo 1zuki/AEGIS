@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PLE harness dependencies and local evaluation runs
+/node_modules/
+/runs/
+/graphify-out/
