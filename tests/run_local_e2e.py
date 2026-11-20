@@ -55,7 +55,7 @@ def task_path(root: Path, raw: str) -> Path:
 
 def _stat_command(command: str, root: Path) -> dict[str, Any] | None:
   match = re.fullmatch(
-      r"if test -f -- (.+); then stat -c %s -- (.+); else exit 1; fi",
+      r"if test -f(?: --)? (.+); then stat -c %s(?: --)? (.+); else exit 1; fi",
       command.strip(),
   )
   if not match:

@@ -51,6 +51,11 @@ By default it starts the actual `serve.py` with GPT-6 Luna through the signed-in
 Codex CLI backend. The synthetic evaluator only allows a small read-only shell
 command set and confines file operations to a temporary task directory.
 
+The local Codex route attaches bounded raster inputs to the CLI's initial
+request so drawing sheets are available as images. It uses high reasoning by
+default; set `AEGIS_LOCAL_THINKING=low|medium|high|max` to trade quality for
+speed.
+
 ## Local model smoke tests
 
 The submitted entry still uses the Google-sponsored model in `submission.yaml`.

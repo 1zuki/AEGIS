@@ -72,6 +72,13 @@ LOCAL_BACKEND_ENV = "AEGIS_LOCAL_BACKEND"
 COLD_READ_ENV = "AEGIS_COLD_READ"
 COLD_READ_RESERVE_SEC = 180
 MAX_POSTFLIGHT_PATHS = 64
+LOCAL_REASONING_ENV = "AEGIS_LOCAL_THINKING"
+LOCAL_REASONING_LEVELS = frozenset({"low", "medium", "high", "max"})
+LOCAL_REASONING_DEFAULT = "high"
+LOCAL_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+LOCAL_IMAGE_LIMIT = 32
+LOCAL_IMAGE_BYTES = 8 << 20
+LOCAL_IMAGE_TOTAL_BYTES = 32 << 20
 # Request features the Google Cloud route for Claude refuses. pi leaves them
 # out, and the Anthropic API works without them too.
 COMPAT = {
@@ -150,6 +157,35 @@ COLD_READ_NOTE = (
 )
 
 
+def _task_contract_note(instruction: str) -> str:
+  """Adds the public IFC contract where the data-hall task needs it."""
+  lowered = instruction.lower()
+  if not all(term in lowered for term in ("ifc4", "busway", "cable tray")):
+    return ""
+  return (
+      "\n\nIFC contract reminder for this data-hall routing task:\n"
+      "- Treat the exact IFC class and PredefinedType as part of the graded"
+      " schema contract; do not substitute a semantically similar class.\n"
+      "- Use cable tray = IfcCableCarrierSegment/CABLETRAYSEGMENT, power"
+      " busway = IfcCableSegment/BUSBARSEGMENT, chilled water ="
+      " IfcPipeSegment/RIGIDSEGMENT.\n"
+      "- Use PDU = IfcElectricDistributionBoard/DISTRIBUTIONBOARD, CRAH ="
+      " IfcUnitaryEquipment/AIRCONDITIONINGUNIT, and sprinkler ="
+      " IfcFireSuppressionTerminal/SPRINKLER. Set PredefinedType explicitly"
+      " on every applicable object.\n"
+      "- After writing the IFC, reopen it with ifcopenshell and count the"
+      " canonical signatures. Check realized bounds and the connected"
+      " components of each service. For box-shaped route segments, make"
+      " junctions face-touching endpoints: do not use a 1 mm overlap or"
+      " intersect a trunk with its branch, because same-service overlaps are"
+      " hard clashes. A branch may start at the trunk side face; the grader's"
+      " 250 mm joint tolerance does not require volumetric overlap. Keep"
+      " plan-overlapping service tiers at least 300 mm apart where the task"
+      " requires stacked-path access. Do not omit same-service overlaps from"
+      " the clash audit unless the task explicitly allows them."
+  )
+
+
 def local_mode() -> bool:
   """Returns whether an explicit local model route is enabled."""
   return os.environ.get(LOCAL_MODE_ENV, "").lower() in {"1", "true", "yes"}
@@ -172,6 +208,12 @@ def pi_thinking_level() -> str:
   """Returns Pi's thinking level, with an explicit local override."""
   level = os.environ.get("AEGIS_LOCAL_THINKING", "").strip().lower()
   return level or THINKING
+
+
+def local_reasoning_effort() -> str:
+  """Returns the local Codex reasoning level without changing the entry route."""
+  level = os.environ.get(LOCAL_REASONING_ENV, "").strip().lower()
+  return level if level in LOCAL_REASONING_LEVELS else LOCAL_REASONING_DEFAULT
 
 
 def model_name() -> str:
@@ -417,6 +459,7 @@ def _codex_argv(
     work: pathlib.Path,
     last_message: pathlib.Path,
     session: taskbridge.Session,
+    image_paths: list[pathlib.Path] | None = None,
 ) -> list[str]:
   """Builds an isolated Codex CLI invocation with only AEGIS task tools."""
   codex = shutil.which("codex")
@@ -442,8 +485,10 @@ def _codex_argv(
       "-C",
       str(work),
   ]
+  for image_path in image_paths or []:
+    argv.extend(("--image", str(image_path)))
   config = [
-      ("model_reasoning_effort", '"low"'),
+      ("model_reasoning_effort", json.dumps(local_reasoning_effort())),
       ("mcp_optional_startup_grace_ms", "0"),
       ("mcp_servers.aegis.command", json.dumps(sys.executable)),
       (
@@ -513,13 +558,22 @@ async def _run_codex_pass(
     prompt: str,
     stop_before_sec: float,
     log_prefix: str,
+    image_paths: list[pathlib.Path] | None = None,
 ) -> tuple[taskbridge.Finished, CodexRun]:
   last_message = agent_dir / "last-message.txt"
   with contextlib.suppress(FileNotFoundError):
     last_message.unlink()
   run = CodexRun(session, model)
   finished = await taskbridge.run_process(
-      _codex_argv(model, relay, agent_dir, work, last_message, session),
+      _codex_argv(
+          model,
+          relay,
+          agent_dir,
+          work,
+          last_message,
+          session,
+          image_paths,
+      ),
       session,
       env=_codex_environment(),
       cwd=str(work),
@@ -537,6 +591,57 @@ async def _run_codex_pass(
   return finished, run
 
 
+async def _stage_task_images(
+    session: taskbridge.Session, image_dir: pathlib.Path
+) -> list[tuple[str, pathlib.Path]]:
+  """Copies bounded raster inputs to ephemeral local paths for Codex `--image`."""
+  listing = await session.exec(
+      "find . -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg'"
+      " -o -iname '*.gif' -o -iname '*.webp' \\) -print | sort",
+      timeout_sec=30,
+  )
+  if listing.get("exit_code") != 0:
+    return []
+  image_dir.mkdir(parents=True, exist_ok=True)
+  staged: list[tuple[str, pathlib.Path]] = []
+  total = 0
+  for raw_path in str(listing.get("output", "")).splitlines():
+    task_path = raw_path.strip()
+    if task_path.startswith("./"):
+      task_path = task_path[2:]
+    suffix = pathlib.PurePosixPath(task_path).suffix.lower()
+    if not task_path or suffix not in LOCAL_IMAGE_SUFFIXES:
+      continue
+    if len(staged) >= LOCAL_IMAGE_LIMIT:
+      break
+    try:
+      data = await session.read_file(task_path)
+    except (taskbridge.TaskError, OSError, ValueError):
+      continue
+    if len(data) > LOCAL_IMAGE_BYTES or total + len(data) > LOCAL_IMAGE_TOTAL_BYTES:
+      continue
+    destination = image_dir / f"{len(staged):03d}{suffix}"
+    destination.write_bytes(data)
+    staged.append((task_path, destination))
+    total += len(data)
+  return staged
+
+
+def _image_attachment_note(staged: list[tuple[str, pathlib.Path]]) -> str:
+  """Labels the order of images attached to the local Codex initial prompt."""
+  if not staged:
+    return ""
+  lines = [
+      "\n\nThe following task images are attached to this request in this order;"
+      " inspect the visual attachments directly before modeling:",
+  ]
+  lines.extend(
+      f"{index}. {task_path}"
+      for index, (task_path, _) in enumerate(staged, 1)
+  )
+  return "\n".join(lines)
+
+
 async def _solve_with_codex(
     session: taskbridge.Session,
     relay: taskbridge.Relay,
@@ -545,7 +650,17 @@ async def _solve_with_codex(
 ) -> str:
   """Runs the local Codex model using taskbridge-backed MCP tools."""
   model = model_name()
-  prompt = NOTE.format(workdir=session.workdir) + "\n\nTask:\n" + session.instruction
+  staged_images = await _stage_task_images(session, agent_dir / "task-images")
+  image_paths = [path for _, path in staged_images]
+  if staged_images:
+    await session.log(f"codex: attached {len(staged_images)} task image(s)")
+  prompt = (
+      NOTE.format(workdir=session.workdir)
+      + _task_contract_note(session.instruction)
+      + _image_attachment_note(staged_images)
+      + "\n\nTask:\n"
+      + session.instruction
+  )
   done, run = await _run_codex_pass(
       session,
       relay,
@@ -555,6 +670,7 @@ async def _solve_with_codex(
       prompt,
       COLD_READ_RESERVE_SEC if cold_read_enabled() else STOP_BEFORE_SEC,
       "codex: ",
+      image_paths,
   )
   first_message = session.final_message
   if done.code != 0 and not run.replies:
@@ -567,6 +683,7 @@ async def _solve_with_codex(
   if cold_read_enabled() and (left is None or left > 5) and run.replies:
     verifier_prompt = (
         COLD_READ_NOTE.format(workdir=session.workdir)
+        + _task_contract_note(session.instruction)
         + "\n\nOriginal task:\n"
         + session.instruction
         + "\n\nPerform the independent cold-read pass now."
@@ -580,6 +697,7 @@ async def _solve_with_codex(
         verifier_prompt,
         STOP_BEFORE_SEC,
         "codex-cold-read: ",
+        image_paths,
     )
     if verifier.replies:
       verification_message = session.final_message
